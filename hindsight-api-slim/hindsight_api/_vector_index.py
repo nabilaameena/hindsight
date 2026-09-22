@@ -7,7 +7,7 @@ import logging
 from sqlalchemy import text
 from sqlalchemy.engine import Connection
 
-from ._pg_extensions import create_extension
+from ._pg_extensions import create_extension, extension_schema
 
 logger = logging.getLogger(__name__)
 
@@ -339,9 +339,19 @@ def per_bank_index_min_submit_interval_seconds() -> int:
 
 
 def bootstrap_extension(conn: Connection, ext: str) -> None:
-    """Install the configured vector extension and any prerequisites if possible."""
+    """Install the configured vector extension and any prerequisites if possible.
+
+    Extensions that are already installed are skipped: running ``CREATE
+    EXTENSION IF NOT EXISTS`` anyway is a no-op on a writable session but an
+    error on a read-only one, and that pointless failure aborts the
+    transaction — which used to strand the migration advisory lock on the
+    backend (#4611).
+    """
     normalized = validate_extension(ext)
     for name, cascade in _EXTENSION_INSTALL_PLAN[normalized]:
+        if extension_schema(conn, name) is not None:
+            logger.debug("Extension %s already installed, skipping CREATE EXTENSION", name)
+            continue
         create_extension(conn, name, cascade=cascade)
 
 
