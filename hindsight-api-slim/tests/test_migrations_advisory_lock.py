@@ -21,7 +21,7 @@ import pytest
 from psycopg2 import errors as pg_errors
 
 from hindsight_api import migrations as migrations_module
-from tests.pg_extension_fakes import FakePgConnection, _Result
+from tests.pg_extension_fakes import FakePgConnection, Result
 
 
 class FakeMigrationConnection(FakePgConnection):
@@ -38,8 +38,11 @@ class FakeMigrationConnection(FakePgConnection):
         fail_on: str | None = None,
         installed: set[str] | None = None,
     ) -> None:
+        # The base class raises a bare RuntimeError on ``fail_on``; this one
+        # models PostgreSQL instead, so it owns the field and leaves the base
+        # one unset.
         super().__init__(extensions={name: ("public", True) for name in (installed or set())})
-        self.fail_statement = fail_on
+        self.fail_on = fail_on
         self.lock_acquired = False
         self.lock_released = False
         self.lock_released_after_abort = False
@@ -62,19 +65,19 @@ class FakeMigrationConnection(FakePgConnection):
             raise pg_errors.InFailedSqlTransaction(
                 "current transaction is aborted, commands ignored until end of transaction block"
             )
-        if self.fail_statement and self.fail_statement in sql:
+        if self.fail_on and self.fail_on in sql:
             self._record(sql)
             self._aborted = True
             raise pg_errors.ReadOnlySqlTransaction("cannot execute CREATE EXTENSION in a read-only transaction")
         if "pg_try_advisory_lock" in sql:
             self._record(sql)
             self.lock_acquired = True
-            return _Result(True)
+            return Result(True)
         if "pg_advisory_unlock" in sql:
             self._record(sql)
             self.lock_released = True
             self.lock_released_after_abort = self._aborted
-            return _Result(True)
+            return Result(True)
         result = super().execute(statement, params, *args, **kwargs)
         self.open_txn = True
         return result
@@ -110,14 +113,14 @@ class _WaitingConnection(FakeMigrationConnection):
             self.polls += 1
             if self.other_holder:
                 self._record(sql)
-                return _Result(False)
+                return Result(False)
         if "FROM pg_locks" in sql:
             self.holder_lookups += 1
             self._record(sql)
             if self.locks_error is not None:
                 self._aborted = True
                 raise self.locks_error
-            return _Result((4242, "hindsight-api", "10.0.0.7", "CREATE INDEX CONCURRENTLY ..."))
+            return Result((4242, "hindsight-api", "10.0.0.7", "CREATE INDEX CONCURRENTLY ..."))
         return super().execute(statement, params, *args, **kwargs)
 
 
@@ -175,6 +178,27 @@ def _error_chain(excinfo: pytest.ExceptionInfo) -> list[str]:
     return names
 
 
+def _failing_migration(monkeypatch: pytest.MonkeyPatch) -> FakeMigrationConnection:
+    """A migrator whose migration fails with its transaction already aborted.
+
+    ``fail_on`` has to match the statement below: without it the fake never
+    aborts, the unlock succeeds with or without the fix, and the tests that
+    check the lock is still released prove nothing.
+    """
+    conn = FakeMigrationConnection(installed={"vector", "pg_trgm"}, fail_on="nonexistent_table")
+    _patch_engine(monkeypatch, conn)
+    _isolate_run_migrations(monkeypatch)
+
+    def failing_internal(*a, **k):
+        with contextlib.suppress(Exception):
+            conn.execute("SELECT count(*) FROM nonexistent_table")
+        assert conn.in_aborted_transaction, "the fake must model the aborted transaction"
+        raise pg_errors.InternalError('relation "nonexistent_table" does not exist')
+
+    monkeypatch.setattr(migrations_module, "_run_migrations_internal", failing_internal)
+    return conn
+
+
 def test_lock_released_when_a_migration_fails(monkeypatch: pytest.MonkeyPatch) -> None:
     """The #4611 core: any failure inside the lock body must still release the lock.
 
@@ -183,19 +207,7 @@ def test_lock_released_when_a_migration_fails(monkeypatch: pytest.MonkeyPatch) -
     InFailedSqlTransaction and left the lock on the backend. The fix rolls back
     first, so the unlock succeeds.
     """
-    conn = FakeMigrationConnection(installed={"vector", "pg_trgm"}, fail_on="nonexistent_table")
-    _patch_engine(monkeypatch, conn)
-    _isolate_run_migrations(monkeypatch)
-
-    def failing_internal(*a, **k):
-        # The failed statement is what leaves the transaction aborted; the
-        # migration then surfaces its own error.
-        with contextlib.suppress(Exception):
-            conn.execute("SELECT count(*) FROM nonexistent_table")
-        assert conn.in_aborted_transaction, "the fake must model the aborted transaction"
-        raise pg_errors.InternalError('relation "nonexistent_table" does not exist')
-
-    monkeypatch.setattr(migrations_module, "_run_migrations_internal", failing_internal)
+    conn = _failing_migration(monkeypatch)
 
     with pytest.raises(RuntimeError):
         migrations_module.run_migrations("postgresql://user:***@host/db")
@@ -208,17 +220,7 @@ def test_lock_released_when_a_migration_fails(monkeypatch: pytest.MonkeyPatch) -
 
 def test_original_error_is_not_masked_by_the_unlock(monkeypatch: pytest.MonkeyPatch) -> None:
     """The migration's own error must surface, not InFailedSqlTransaction."""
-    conn = FakeMigrationConnection(installed={"vector", "pg_trgm"}, fail_on="nonexistent_table")
-    _patch_engine(monkeypatch, conn)
-    _isolate_run_migrations(monkeypatch)
-
-    def failing_internal(*a, **k):
-        with contextlib.suppress(Exception):
-            conn.execute("SELECT count(*) FROM nonexistent_table")
-        assert conn.in_aborted_transaction, "the fake must model the aborted transaction"
-        raise pg_errors.InternalError('relation "nonexistent_table" does not exist')
-
-    monkeypatch.setattr(migrations_module, "_run_migrations_internal", failing_internal)
+    conn = _failing_migration(monkeypatch)
 
     with pytest.raises(RuntimeError) as excinfo:
         migrations_module.run_migrations("postgresql://user:***@host/db")

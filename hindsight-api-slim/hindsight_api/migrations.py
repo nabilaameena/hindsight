@@ -541,13 +541,16 @@ def run_migrations(
                 conn.commit()
                 time.sleep(_LOCK_POLL_INTERVAL_SECS)
 
-            # Commit AFTER acquiring the lock too.  pg_advisory_lock is session-level
-            # and survives the COMMIT, but the open transaction on this connection
-            # would otherwise block any CREATE INDEX CONCURRENTLY in the migration.
-            conn.commit()
-            logger.debug("Migration advisory lock acquired")
-
+            # Everything from here on is inside the try, so the lock is released
+            # however we leave — the commit below included.
             try:
+                # Commit AFTER acquiring the lock too.  pg_advisory_lock is
+                # session-level and survives the COMMIT, but the open transaction
+                # on this connection would otherwise block any CREATE INDEX
+                # CONCURRENTLY in the migration.
+                conn.commit()
+                logger.debug("Migration advisory lock acquired")
+
                 vector_extension = configured_vector_extension()
                 _bootstrap_vector_extension_for_migrations(conn, vector_extension)
 
