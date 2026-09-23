@@ -208,8 +208,13 @@ def _get_schema_lock_id(schema: str) -> int:
     return int.from_bytes(hash_bytes, byteorder="big") % (2**31)
 
 
-#: How often to report that we are still waiting for the migration advisory lock.
-#: The poll itself stays at 0.5s; only the log line is throttled.
+#: How often to poll for the migration advisory lock.
+_LOCK_POLL_INTERVAL_SECS = 0.5
+
+#: How long a wait has to last before it is worth a log line, and how often to
+#: repeat it afterwards.  Queuing briefly behind another worker is routine; only
+#: a wait that outlasts this is a symptom.
+_LOCK_WAIT_REPORT_AFTER_SECS = 5.0
 _LOCK_WAIT_REPORT_INTERVAL_SECS = 30.0
 
 
@@ -224,9 +229,10 @@ def _advisory_lock_holder(conn: Connection, lock_id: int) -> str | None:
     must never turn a wait into a failed migration.
 
     ``pg_advisory_lock(bigint)`` stores the key as classid = high 32 bits,
-    objid = low 32 bits, objsubid = 1.  ``lock_id`` is reduced mod 2**31, so
-    classid is always 0 — matching on it keeps a two-argument advisory lock
-    with a colliding objid from being reported as the holder.
+    objid = low 32 bits, objsubid = 1; the two-argument form uses objsubid = 2.
+    Matching objsubid = 1 therefore excludes a two-argument lock with a
+    colliding objid, and classid = 0 (``lock_id`` is reduced mod 2**31, so its
+    high word is always zero) excludes a 64-bit key that shares the low word.
     """
     try:
         row = conn.execute(
@@ -495,7 +501,7 @@ def run_migrations(
         with engine.connect() as conn:
             logger.debug(f"Acquiring migration advisory lock for schema '{schema_name}' (id={lock_id})...")
             waited_since = time.monotonic()
-            next_report_at = 0.0
+            next_report_at = _LOCK_WAIT_REPORT_AFTER_SECS
             while True:
                 acquired = conn.execute(text(f"SELECT pg_try_advisory_lock({lock_id})")).scalar()
                 if acquired:
@@ -505,10 +511,11 @@ def run_migrations(
                 # who is holding it, so an operator can find the blocking
                 # backend (and see the pooler-recycled-leak shape of #4611).
                 #
-                # Report on the first failed attempt and then every
-                # _LOCK_WAIT_REPORT_INTERVAL_SECS: waiting is routine during a
-                # rolling deploy, and one line per 0.5s poll buries the signal
-                # in exactly the incident this is meant to explain.
+                # Report once the wait passes _LOCK_WAIT_REPORT_AFTER_SECS and
+                # then every _LOCK_WAIT_REPORT_INTERVAL_SECS: queuing briefly
+                # behind another worker is routine during a rolling deploy, and
+                # one line per poll buries the signal in exactly the incident
+                # this is meant to explain.
                 waited = time.monotonic() - waited_since
                 if waited >= next_report_at:
                     next_report_at = waited + _LOCK_WAIT_REPORT_INTERVAL_SECS
@@ -519,19 +526,20 @@ def run_migrations(
                     holder = _advisory_lock_holder(conn, lock_id)
                     logger.warning(
                         "Waiting for migration advisory lock (id=%s, schema=%s) held by %s; "
-                        "waited %.0fs so far, polling every 0.5s. If the holder is a stale pooled "
+                        "waited %.0fs so far, polling every %ss. If the holder is a stale pooled "
                         "backend, point %s at the direct PostgreSQL endpoint to bypass the pooler.",
                         lock_id,
                         schema_name,
                         holder or "another session (holder not found in pg_locks)",
                         waited,
+                        _LOCK_POLL_INTERVAL_SECS,
                         ENV_MIGRATION_DATABASE_URL,
                     )
                 # Commit the transaction so this connection holds no open snapshot
                 # while waiting.  This prevents blocking CREATE INDEX CONCURRENTLY
                 # that may be running in the migration worker.
                 conn.commit()
-                time.sleep(0.5)
+                time.sleep(_LOCK_POLL_INTERVAL_SECS)
 
             # Commit AFTER acquiring the lock too.  pg_advisory_lock is session-level
             # and survives the COMMIT, but the open transaction on this connection
