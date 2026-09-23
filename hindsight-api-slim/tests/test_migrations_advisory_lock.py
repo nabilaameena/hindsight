@@ -13,6 +13,7 @@ SQLAlchemy connection and engine, mirroring the read-only ``CREATE EXTENSION``
 failure from the issue.
 """
 
+import contextlib
 import logging
 from typing import Any
 
@@ -44,6 +45,11 @@ class FakeMigrationConnection(FakePgConnection):
         self.lock_released_after_abort = False
         self.open_txn = False
         self._aborted = False
+
+    @property
+    def in_aborted_transaction(self) -> bool:
+        """Whether a statement has failed and the transaction is not yet ended."""
+        return self._aborted
 
     def _record(self, sql: str) -> None:
         self.statements.append(sql)
@@ -177,14 +183,17 @@ def test_lock_released_when_a_migration_fails(monkeypatch: pytest.MonkeyPatch) -
     InFailedSqlTransaction and left the lock on the backend. The fix rolls back
     first, so the unlock succeeds.
     """
-    conn = FakeMigrationConnection(installed={"vector", "pg_trgm"})
+    conn = FakeMigrationConnection(installed={"vector", "pg_trgm"}, fail_on="nonexistent_table")
     _patch_engine(monkeypatch, conn)
     _isolate_run_migrations(monkeypatch)
 
     def failing_internal(*a, **k):
-        # A failed migration statement leaves the transaction aborted.
-        conn.execute("SELECT count(*) FROM nonexistent_table")
-        raise pg_errors.InternalError('relation "nonexistent" does not exist')
+        # The failed statement is what leaves the transaction aborted; the
+        # migration then surfaces its own error.
+        with contextlib.suppress(Exception):
+            conn.execute("SELECT count(*) FROM nonexistent_table")
+        assert conn.in_aborted_transaction, "the fake must model the aborted transaction"
+        raise pg_errors.InternalError('relation "nonexistent_table" does not exist')
 
     monkeypatch.setattr(migrations_module, "_run_migrations_internal", failing_internal)
 
@@ -199,12 +208,14 @@ def test_lock_released_when_a_migration_fails(monkeypatch: pytest.MonkeyPatch) -
 
 def test_original_error_is_not_masked_by_the_unlock(monkeypatch: pytest.MonkeyPatch) -> None:
     """The migration's own error must surface, not InFailedSqlTransaction."""
-    conn = FakeMigrationConnection(installed={"vector", "pg_trgm"})
+    conn = FakeMigrationConnection(installed={"vector", "pg_trgm"}, fail_on="nonexistent_table")
     _patch_engine(monkeypatch, conn)
     _isolate_run_migrations(monkeypatch)
 
     def failing_internal(*a, **k):
-        conn.execute("SELECT count(*) FROM nonexistent_table")
+        with contextlib.suppress(Exception):
+            conn.execute("SELECT count(*) FROM nonexistent_table")
+        assert conn.in_aborted_transaction, "the fake must model the aborted transaction"
         raise pg_errors.InternalError('relation "nonexistent_table" does not exist')
 
     monkeypatch.setattr(migrations_module, "_run_migrations_internal", failing_internal)
