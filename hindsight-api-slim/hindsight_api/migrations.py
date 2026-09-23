@@ -50,7 +50,7 @@ from ._vector_index import (
     should_defer_index_creation,
     uses_per_bank_vector_indexes,
 )
-from .config import ENV_MIGRATION_ISOLATION, get_config
+from .config import ENV_MIGRATION_DATABASE_URL, ENV_MIGRATION_ISOLATION, get_config
 from .db_url import is_oracle_url, to_libpq_url
 from .utils import mask_network_location
 
@@ -208,12 +208,25 @@ def _get_schema_lock_id(schema: str) -> int:
     return int.from_bytes(hash_bytes, byteorder="big") % (2**31)
 
 
+#: How often to report that we are still waiting for the migration advisory lock.
+#: The poll itself stays at 0.5s; only the log line is throttled.
+_LOCK_WAIT_REPORT_INTERVAL_SECS = 30.0
+
+
 def _advisory_lock_holder(conn: Connection, lock_id: int) -> str | None:
     """Describe who holds the migration advisory lock, or None if not found.
 
     Best effort: this runs while a migrator is stuck waiting, so any error
     here must not break the wait loop — an empty catalog row just means we
-    could not identify the holder.
+    could not identify the holder.  A failure leaves the transaction aborted,
+    so the caller must end it before its next statement — the wait loop's
+    ``conn.commit()`` does, which is why this runs before it.  A diagnostic
+    must never turn a wait into a failed migration.
+
+    ``pg_advisory_lock(bigint)`` stores the key as classid = high 32 bits,
+    objid = low 32 bits, objsubid = 1.  ``lock_id`` is reduced mod 2**31, so
+    classid is always 0 — matching on it keeps a two-argument advisory lock
+    with a colliding objid from being reported as the holder.
     """
     try:
         row = conn.execute(
@@ -222,8 +235,8 @@ def _advisory_lock_holder(conn: Connection, lock_id: int) -> str | None:
                 "coalesce(a.query, '') "
                 "FROM pg_locks l "
                 "LEFT JOIN pg_stat_activity a ON a.pid = l.pid "
-                "WHERE l.locktype = 'advisory' AND l.objid = :lock_id "
-                "AND l.objsubid IN (0, 1) AND l.granted "
+                "WHERE l.locktype = 'advisory' AND l.classid = 0 AND l.objid = :lock_id "
+                "AND l.objsubid = 1 AND l.granted "
                 "LIMIT 1"
             ),
             {"lock_id": lock_id},
@@ -481,27 +494,43 @@ def run_migrations(
         engine = create_engine(migration_url, poolclass=NullPool)
         with engine.connect() as conn:
             logger.debug(f"Acquiring migration advisory lock for schema '{schema_name}' (id={lock_id})...")
+            waited_since = time.monotonic()
+            next_report_at = 0.0
             while True:
                 acquired = conn.execute(text(f"SELECT pg_try_advisory_lock({lock_id})")).scalar()
                 if acquired:
                     break
-                # Commit the transaction so this connection holds no open snapshot
-                # while waiting.  This prevents blocking CREATE INDEX CONCURRENTLY
-                # that may be running in the migration worker.
-                conn.commit()
                 # A worker stuck here used to look like a silent hang: no log
                 # line, no timeout, for as long as the lock stays taken.  Say
                 # who is holding it, so an operator can find the blocking
                 # backend (and see the pooler-recycled-leak shape of #4611).
-                holder = _advisory_lock_holder(conn, lock_id)
-                logger.warning(
-                    "Waiting for migration advisory lock (id=%s, schema=%s) held by %s; "
-                    "polling every 0.5s. Set HINDSIGHT_API_MIGRATION_LOCK_TIMEOUT_SECS "
-                    "to fail instead of waiting forever.",
-                    lock_id,
-                    schema_name,
-                    holder or "another session (holder not found in pg_locks)",
-                )
+                #
+                # Report on the first failed attempt and then every
+                # _LOCK_WAIT_REPORT_INTERVAL_SECS: waiting is routine during a
+                # rolling deploy, and one line per 0.5s poll buries the signal
+                # in exactly the incident this is meant to explain.
+                waited = time.monotonic() - waited_since
+                if waited >= next_report_at:
+                    next_report_at = waited + _LOCK_WAIT_REPORT_INTERVAL_SECS
+                    # Look the holder up BEFORE the commit below: this statement
+                    # autobegins a transaction, and running it after the commit
+                    # would hold its snapshot across the sleep — the very thing
+                    # the commit exists to prevent.
+                    holder = _advisory_lock_holder(conn, lock_id)
+                    logger.warning(
+                        "Waiting for migration advisory lock (id=%s, schema=%s) held by %s; "
+                        "waited %.0fs so far, polling every 0.5s. If the holder is a stale pooled "
+                        "backend, point %s at the direct PostgreSQL endpoint to bypass the pooler.",
+                        lock_id,
+                        schema_name,
+                        holder or "another session (holder not found in pg_locks)",
+                        waited,
+                        ENV_MIGRATION_DATABASE_URL,
+                    )
+                # Commit the transaction so this connection holds no open snapshot
+                # while waiting.  This prevents blocking CREATE INDEX CONCURRENTLY
+                # that may be running in the migration worker.
+                conn.commit()
                 time.sleep(0.5)
 
             # Commit AFTER acquiring the lock too.  pg_advisory_lock is session-level

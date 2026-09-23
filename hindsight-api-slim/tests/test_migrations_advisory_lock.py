@@ -72,11 +72,13 @@ class FakeMigrationConnection:
         self.commits = 0
         self.rollbacks = 0
         self.statements = []
+        self.open_txn = False
         self._aborted = False
 
     def execute(self, statement, params=None, *args, **kwargs):
         sql = str(statement)
         self.statements.append(sql)
+        self.open_txn = True
         if self._aborted:
             raise pg_errors.InFailedSqlTransaction(
                 "current transaction is aborted, commands ignored until end of transaction block"
@@ -112,6 +114,7 @@ class FakeMigrationConnection:
         return _Scalar(None)
 
     def commit(self):
+        self.open_txn = False
         # A COMMIT on an aborted transaction is a ROLLBACK in PostgreSQL.
         if self._aborted:
             self._aborted = False
@@ -120,6 +123,7 @@ class FakeMigrationConnection:
             self.commits += 1
 
     def rollback(self):
+        self.open_txn = False
         self._aborted = False
         self.rollbacks += 1
 
@@ -341,17 +345,27 @@ class _BootstrapRecordingConnection:
 class _WaitingConnection(FakeMigrationConnection):
     """A migrator that finds the lock taken by another worker at first."""
 
-    def __init__(self):
+    def __init__(self, locks_error=None):
         super().__init__(installed={"vector", "pg_trgm"})
         self.other_holder = True
         self.polls = 0
+        self.holder_lookups = 0
+        self.locks_error = locks_error
 
     def execute(self, statement, params=None, *args, **kwargs):
         sql = str(statement)
-        if "pg_try_advisory_lock" in sql:
+        if "pg_try_advisory_lock" in sql and not self._aborted:
             self.polls += 1
             if self.other_holder:
                 return _Scalar(False)
+        if "FROM pg_locks" in sql:
+            self.holder_lookups += 1
+            self.statements.append(sql)
+            self.open_txn = True
+            if self.locks_error is not None:
+                self._aborted = True
+                raise self.locks_error
+            return _Row((4242, "hindsight-api", "10.0.0.7", "CREATE INDEX CONCURRENTLY ..."))
         return super().execute(statement, params, *args, **kwargs)
 
 
@@ -388,6 +402,60 @@ def test_waiting_worker_logs_while_polling(monkeypatch, caplog):
 
     waiting_logs = [r for r in caplog.records if "waiting" in r.getMessage().lower()]
     assert waiting_logs, "a worker polling for the lock must log while waiting"
+    message = waiting_logs[0].getMessage()
+    assert "pid=4242" in message, "the log must name the backend holding the lock"
+    # The remedy it points at has to be a knob that exists.
+    assert "HINDSIGHT_API_MIGRATION_DATABASE_URL" in message
+
+
+def test_waiting_worker_holds_no_snapshot_across_the_sleep(monkeypatch):
+    """The holder lookup must not reopen a txn that spans the poll sleep.
+
+    The commit in the wait loop exists so this connection holds no snapshot
+    while waiting, which would otherwise block a CREATE INDEX CONCURRENTLY in
+    the migration worker.  A diagnostic SELECT issued after that commit
+    quietly undoes it.
+    """
+    conn = _WaitingConnection()
+    _patch_engine(monkeypatch, conn)
+    _isolate_run_migrations(monkeypatch)
+
+    seen = []
+
+    def fake_sleep(_seconds):
+        seen.append(conn.open_txn)
+        conn.other_holder = False
+
+    monkeypatch.setattr(migrations_module.time, "sleep", fake_sleep)
+
+    migrations_module.run_migrations("postgresql://user:pass@host/db")
+
+    assert conn.holder_lookups >= 1, "the holder lookup must actually run"
+    assert seen and not any(seen), "no transaction may be open while the worker sleeps"
+
+
+def test_failed_holder_lookup_does_not_break_the_wait_loop(monkeypatch, caplog):
+    """A best-effort diagnostic must never turn a wait into a failed migration.
+
+    A failing pg_locks lookup leaves the transaction aborted; without a
+    rollback the next pg_try_advisory_lock raises InFailedSqlTransaction and
+    the migration fails although the lock was merely busy.
+    """
+    conn = _WaitingConnection(locks_error=pg_errors.InsufficientPrivilege("permission denied for view pg_locks"))
+    _patch_engine(monkeypatch, conn)
+    _isolate_run_migrations(monkeypatch)
+
+    def fake_sleep(_seconds):
+        conn.other_holder = False
+
+    monkeypatch.setattr(migrations_module.time, "sleep", fake_sleep)
+
+    with caplog.at_level(logging.DEBUG, logger="hindsight_api.migrations"):
+        migrations_module.run_migrations("postgresql://user:pass@host/db")
+
+    assert conn.lock_acquired and conn.lock_released
+    waiting_logs = [r for r in caplog.records if "waiting" in r.getMessage().lower()]
+    assert waiting_logs, "the wait is still reported when the holder cannot be identified"
 
 
 def test_extension_schema_helper_contract():
