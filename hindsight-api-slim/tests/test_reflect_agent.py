@@ -646,6 +646,67 @@ class TestReflectAgentMocked:
         mock_llm.call.assert_not_called()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "has_mental_models,include_observations,include_recall,expected_choice",
+        [
+            (True, True, True, "search_mental_models"),
+            (False, True, True, "search_observations"),
+            (False, False, True, "recall"),
+            (False, False, False, "auto"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "content,finish_reason",
+        [("Hello!", "stop"), (None, "length"), ("x" * 600, None)],
+        ids=["text", "empty-truncated", "long-unknown"],
+    )
+    async def test_no_tool_call_reports_request_and_response(
+        self,
+        mock_llm: MagicMock,
+        mock_functions: dict[str, AsyncMock],
+        has_mental_models: bool,
+        include_observations: bool,
+        include_recall: bool,
+        expected_choice: str,
+        content: str | None,
+        finish_reason: str | None,
+    ) -> None:
+        mock_llm.provider = "openai"
+        mock_llm.model = "test-model"
+        mock_llm.call_with_tools.return_value = LLMToolCallResult(
+            content=content,
+            tool_calls=[],
+            finish_reason=finish_reason,
+        )
+        with pytest.raises(ReflectToolCallError) as exc_info:
+            await run_reflect_agent(
+                llm_config=mock_llm,
+                bank_id="test-bank",
+                query="hi",
+                bank_profile={"name": "Test", "mission": "Testing"},
+                has_mental_models=has_mental_models,
+                include_observations=include_observations,
+                include_recall=include_recall,
+                budget="low",
+                max_iterations=5,
+                **mock_functions,
+            )
+        message = str(exc_info.value)
+        assert "during initial tool selection" in message
+        assert f"tool_choice={expected_choice!r}" in message
+        assert f"finish_reason={finish_reason!r}" in message
+        assert "openai/test-model" in message
+        if content:
+            preview = content[:500] + ("..." if len(content) > 500 else "")
+            assert f"Response: {preview!r}" in message
+        else:
+            assert "returned no content" in message
+        mock_llm.call_with_tools.assert_awaited_once()
+        mock_llm.call.assert_not_called()
+        for function in mock_functions.values():
+            function.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_short_circuited_agent_may_still_retrieve_under_auto(self, mock_llm, mock_functions):
         """After release, the agent can still choose to retrieve deeper itself (its own query)."""
         mock_functions["search_mental_models_fn"].return_value = {
@@ -1801,6 +1862,7 @@ class TestDoneToolStringDocument:
     def mock_functions(self):
         return {
             "search_mental_models_fn": AsyncMock(return_value={"mental_models": []}),
+            "read_mental_models_fn": AsyncMock(return_value={"mental_models": []}),
             "search_observations_fn": AsyncMock(return_value={"observations": []}),
             "recall_fn": AsyncMock(return_value={"memories": [{"id": "mem-1", "content": "test memory"}]}),
             "expand_fn": AsyncMock(return_value={"memories": []}),

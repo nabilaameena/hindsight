@@ -186,9 +186,11 @@ class ReflectToolCallError(RuntimeError):
     calling and silently drop the tool definitions from the request (e.g. litellm's
     Vertex AI gpt-oss MaaS path strips ``tools``/``tool_choice`` when the model is
     flagged as not supporting them). The model then answers in free text that may
-    mimic a ``done`` payload. Rather than salvage that untooled text -- and risk
-    surfacing raw tool-call JSON as the answer -- we fail loudly so the caller can
-    switch to a tool-calling-capable model/transport.
+    mimic a ``done`` payload. Other endpoints support tools but ignore the forced
+    tool choice for some prompts only (#4557). Rather than salvage that untooled
+    text -- and risk surfacing raw tool-call JSON as the answer -- we fail loudly,
+    naming the requested tool choice and the response's finish reason so the
+    operator can tell the two cases apart.
     """
 
 
@@ -1237,20 +1239,29 @@ async def _run_reflect_agent_inner(
             # means one of two things:
             #   * the model already gathered evidence via earlier tool calls and is
             #     now stopping -- fine, synthesize a clean final answer below;
-            #   * the transport can't produce tool calls at all, so it only ever
-            #     returns free text (e.g. litellm strips tools on the Vertex gpt-oss
-            #     MaaS path). In that case ``saw_tool_call`` is still False.
+            #   * no usable tool call has been produced yet. The endpoint may have
+            #     ignored this prompt's tool choice, or lack tool support altogether
+            #     (e.g. litellm strips tools on the Vertex gpt-oss MaaS path).
             # We no longer salvage that free text as the answer -- it can be a raw
             # done()-payload with sibling id fields leaking into user-visible text.
-            # Fail loudly instead so the caller picks a tool-calling-capable model.
+            # Fail loudly with request/response diagnostics instead.
             if not saw_tool_call:
                 snippet = (result.content or "").strip()
                 if len(snippet) > 500:
                     snippet = snippet[:500] + "..."
                 detail = f" Response: {snippet!r}" if snippet else " The model returned no content."
+                # A single text-only response does not prove the model lacks tool
+                # support: some endpoints ignore a forced choice for short prompts.
+                # Report the requested choice and normalized response so operators can probe the
+                # failing contract, including truncation, without changing providers.
+                requested_choice = iter_tool_choice.function_name or iter_tool_choice.mode.value
                 raise ReflectToolCallError(
                     f"Reflect requires a tool-calling model, but {llm_config.provider}/{llm_config.model} "
-                    f"produced no usable tool call (the transport may not support function calling)." + detail
+                    "produced no usable tool call during initial tool selection "
+                    f"(iteration={iteration + 1}, tool_choice={requested_choice!r}, "
+                    f"finish_reason={result.finish_reason!r}). "
+                    "Check tool-choice handling for this prompt on the configured endpoint; "
+                    "a successful tool call for another prompt does not establish compatibility." + detail
                 )
             # Model tool-called earlier and is now stopping with prose.
             return await _finish(iteration + 1)

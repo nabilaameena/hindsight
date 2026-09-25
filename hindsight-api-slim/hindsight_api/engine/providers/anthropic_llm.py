@@ -208,7 +208,7 @@ class AnthropicLLM(LLMInterface):
 
         # Import and initialize Anthropic client
         try:
-            from anthropic import AsyncAnthropic
+            from anthropic import AsyncAnthropic, Timeout
 
             # SDK retries disabled — wrapper-level retry loop in ``call`` handles
             # backoff (mirrors ``OpenAICompatibleLLM`` so the two providers behave
@@ -216,8 +216,10 @@ class AnthropicLLM(LLMInterface):
             client_kwargs: dict[str, Any] = {"api_key": self.api_key, "max_retries": 0}
             if self.base_url:
                 client_kwargs["base_url"] = self.base_url
-            # Per-phase so the connect leg is capped independently (issue #3881).
-            client_kwargs["timeout"] = build_sdk_timeout(self.timeout or _DEFAULT_ANTHROPIC_TIMEOUT)
+            # Per-phase so the connect leg is capped independently (issue #3881). Built
+            # with the SDK's own Timeout: anthropic 1.x runs on httpx2 and rejects an
+            # httpx.Timeout, or on 1.0.x fails every request with it (issue #4683).
+            client_kwargs["timeout"] = build_sdk_timeout(self.timeout or _DEFAULT_ANTHROPIC_TIMEOUT, Timeout)
             if default_headers:
                 client_kwargs["default_headers"] = default_headers
 
