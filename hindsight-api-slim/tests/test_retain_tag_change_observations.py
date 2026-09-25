@@ -27,7 +27,7 @@ import pytest
 from hindsight_api import RequestContext
 from hindsight_api.config import _get_raw_config
 from hindsight_api.engine.memories import FactRecord, get_memories
-from hindsight_api.engine.memory_engine import MemoryEngine, fq_table
+from hindsight_api.engine.memory_engine import MemoryEngine, _renamed_scopes, fq_table
 
 # Two chunk-sized blocks (chunk size is 3000 chars). Keeping BLOCK_A byte-identical
 # across a re-ingest is what keeps the second retain on the delta path: chunking is
@@ -264,7 +264,7 @@ async def test_observation_scopes_change_re_retain_invalidates_observations(
 async def test_retag_renames_explicit_observation_scopes(memory: MemoryEngine, request_context: RequestContext):
     """A tags PATCH renames the tags an explicit observation_scopes spec froze (#4609).
 
-    A fact retained with ``observation_scopes: [["project:old"], ["hotels"]]`` carries
+    A fact retained with an explicit spec naming ``project:old`` carries
     that spec verbatim on its memory units; the tags PATCH that renames
     ``project:old`` -> ``project:new`` rewrites ``tags`` but used to leave the spec
     pointing at the old tag, so the next consolidation rebuilt the observation under
@@ -333,3 +333,14 @@ async def test_retag_renames_explicit_observation_scopes(memory: MemoryEngine, r
 
     finally:
         await memory.delete_bank(bank_id, request_context=request_context)
+
+
+def test_renamed_scopes_only_remaps_a_single_tag_rename():
+    spec = [["a"], ["a", "b"]]
+    assert _renamed_scopes(spec, ["a", "b"], ["c", "b"]) == [["c"], ["c", "b"]]
+    assert _renamed_scopes(json.dumps(spec), ["a", "b"], ["c", "b"]) == [["c"], ["c", "b"]]
+    # Two tags swapped at once cannot be paired without guessing: left as-is.
+    assert _renamed_scopes(spec, ["a", "b"], ["c", "d"]) == spec
+    assert _renamed_scopes(spec, ["a", "b"], ["b"]) == spec
+    assert _renamed_scopes("per_tag", ["a"], ["c"]) == "per_tag"
+    assert _renamed_scopes(spec, None, ["c"]) == spec

@@ -667,6 +667,7 @@ from .response_models import (
 )
 from .response_models import RecallResult as RecallResultModel
 from .retain import bank_utils, embedding_utils
+from .retain.fact_storage import _normalize_scopes
 from .retain.fold import FoldMemberRef
 from .retain.types import RetainBatchResult, RetainContentDict, merge_processed_content_tokens
 from .search.reranking import CrossEncoderReranker, apply_combined_scoring
@@ -1935,49 +1936,24 @@ def _summarize_refresh_tool_calls(
     return summaries
 
 
-def _retagged_scopes(existing: Any, rename: dict[str, str]) -> Any:
-    """Rewrite the tags an ``observation_scopes`` spec names, after a retag.
+def _renamed_scopes(scopes: Any, old_tags: list[str] | None, new_tags: list[str]) -> Any:
+    """Move a single-tag rename into an explicit ``observation_scopes`` spec (#4609).
 
-    ``update_document`` rewrites ``memory_units.tags``, but a unit also carries an
-    ``observation_scopes`` spec — and the one kind that freezes tag *strings* is an
-    explicit ``list[list[str]]``. The scalar modes re-derive their scopes from the
-    unit's fresh tags at consolidation time (``per_tag``, ``all_combinations``), and
-    ``shared`` / ``combined`` / ``None`` never name a tag at all. Left frozen, an
-    explicit spec re-routes the retagged facts under the OLD tag on the next
-    consolidation: every project rename strands a tail of observations recall can no
-    longer reach by the new tag (#4609).
-
-    So a retag maps every renamed tag inside each scope entry, in place: the spec's
-    shape and every entry the rename does not touch survive verbatim. ``rename`` maps
-    OLD tag -> NEW tag; an empty map (or a non-list spec: a scalar mode string) is a
-    no-op.
+    An explicit ``list[list[str]]`` spec freezes tag strings at retain time, so a retag
+    that renames ``project:old`` -> ``project:new`` would leave consolidation rebuilding
+    observations under the old tag. Scalar modes re-derive from the unit's fresh tags
+    and need nothing. Only an unambiguous rename (exactly one tag removed, one added)
+    is remapped; any other retag returns the spec unchanged.
     """
-    if not rename or not isinstance(existing, list):
-        return existing
-    if existing and all(isinstance(t, str) for t in existing):
-        # A scope ROW (a flat list of tag strings), not a spec of rows.
-        return [rename.get(t, t) for t in existing]
-    return [_retagged_scopes(entry, rename) for entry in existing]
-
-
-def _scope_rename_map(current_tags: list[str] | None, new_tags: list[str] | None) -> dict[str, str]:
-    """OLD -> NEW tag pairs a retag renames, read from the tags before the PATCH.
-
-    Built from set differences, position-matched: the tags removed from the
-    document's tag set paired with the ones added, in their set order. A retag that
-    removes and adds a DIFFERENT number of tags is not a rename — it cannot be
-    paired without guessing, so the map stays empty and explicit specs are left
-    frozen (the observation cascade still deletes and rebuilds them; only the
-    unambiguous rename case is remapped). An empty map also covers the equal-set
-    no-op PATCH, which never reaches this code path anyway.
-    """
-    if current_tags is None or new_tags is None:
-        return {}
-    removed = [t for t in current_tags if t not in set(new_tags)]
-    added = [t for t in new_tags if t not in set(current_tags)]
-    if not removed or len(removed) != len(added):
-        return {}
-    return dict(zip(removed, added))
+    scopes = _normalize_scopes(scopes)
+    if not isinstance(scopes, list) or old_tags is None:
+        return scopes
+    removed = set(old_tags) - set(new_tags)
+    added = set(new_tags) - set(old_tags)
+    if len(removed) != 1 or len(added) != 1:
+        return scopes
+    old, new = removed.pop(), added.pop()
+    return [[new if t == old else t for t in scope] for scope in scopes]
 
 
 def _operation_details(operation_type: str, result_metadata: dict[str, Any]) -> dict[str, Any] | None:
@@ -10722,7 +10698,8 @@ class MemoryEngine(MemoryEngineInterface):
         invalidated_obs = 0
         async with acquire_with_retry(backend) as conn:
             async with conn.transaction():
-                from .memories import META_OBSERVATION_SCOPES, MemoryPatch, get_memories
+                from .memories import MemoryPatch, get_memories
+                from .memories.base import META_OBSERVATION_SCOPES
                 from .retain.entity_labels import label_tag_keys, split_label_tags
 
                 _store = get_memories()
@@ -10826,33 +10803,19 @@ class MemoryEngine(MemoryEngineInterface):
                     # invalidate the observations built on them and requeue their sources so the
                     # next consolidation rebuilds them under the new tags (the cascade the SQL
                     # branch does by hand — delete_stale_observations requeues surviving co-sources).
-                    # An explicit `observation_scopes` spec freezes its tag strings at retain time,
-                    # so it has to move with the rename or re-consolidation re-creates the
-                    # observations under the OLD tag (#4609).
-                    _scope_rename = _scope_rename_map(current_tags, tags)
                     _doc_page = await _store.scan_memories(
                         conn=conn, fq_table=fq_table, bank_id=bank_id, document_id=document_id, limit=1_000_000
                     )
                     _doc_units = _doc_page.memories
                     if _doc_units:
-                        _store_patches = []
+                        _patches = []
                         for m in _doc_units:
-                            # The store's read model decodes the spec; decode defensively
-                            # in case a backend hands the raw JSON string back.
-                            _raw_scopes = m.observation_scopes
-                            if isinstance(_raw_scopes, str):
-                                try:
-                                    _raw_scopes = json.loads(_raw_scopes)
-                                except (json.JSONDecodeError, ValueError):
-                                    _raw_scopes = None
-                            _unit_scopes = _retagged_scopes(_raw_scopes, _scope_rename)
-                            _patch_fields: dict[str, Any] = {"unit_id": m.unit_id, "tags": _retagged(m.tags)}
-                            if _unit_scopes is not None:
-                                # Bag metadata MERGES, so carry the whole encoded spec: an
-                                # absent key would leave a stale spec in place untouched.
-                                _patch_fields["metadata"] = {META_OBSERVATION_SCOPES: json.dumps(_unit_scopes)}
-                            _store_patches.append(MemoryPatch(**_patch_fields))
-                        await _store.update_memories(bank_id, _store_patches)
+                            _patch = MemoryPatch(unit_id=m.unit_id, tags=_retagged(m.tags))
+                            _scopes = _renamed_scopes(m.observation_scopes, current_tags, retag)
+                            if _scopes != _normalize_scopes(m.observation_scopes):
+                                _patch.metadata = {META_OBSERVATION_SCOPES: json.dumps(_scopes)}
+                            _patches.append(_patch)
+                        await _store.update_memories(bank_id, _patches)
                     _src_ids = [m.unit_id for m in _doc_units if m.fact_type in ("experience", "world")]
                     if _src_ids:
                         invalidated_obs = await _store.delete_stale_observations(
@@ -10862,55 +10825,27 @@ class MemoryEngine(MemoryEngineInterface):
                             conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=_src_ids, when=None
                         )
                 elif retag is not None:
-                    # An explicit `observation_scopes` spec freezes its tag strings at retain
-                    # time (an explicit list[list[str]] does; per_tag/all_combinations
-                    # re-derive from the fresh tags, shared/combined/None name none), so a
-                    # rename inside it has to move with the retag or re-consolidation
-                    # re-creates the observations under the OLD tag (#4609). Derived from
-                    # the tags read BEFORE the overwrite; an ambiguous retag (drop+add of
-                    # different counts) renames nothing and leaves specs frozen.
-                    _scope_rename = _scope_rename_map(current_tags, tags)
-                    if _scope_rename:
-                        # Only rows whose spec actually names a renamed tag are rewritten:
-                        # a JSONB read comes back as text on a driver without a codec, so
-                        # the rename runs on the decoded value and re-encodes.
-                        _scope_rows = await conn.fetch(
-                            f"SELECT id, observation_scopes FROM {fq_table('memory_units')} "
-                            f"WHERE document_id = $1 AND bank_id = $2 AND observation_scopes IS NOT NULL",
-                            document_id,
-                            bank_id,
-                        )
-                        _rescoped: dict[str, list] = {}
-                        for _row in _scope_rows:
-                            _raw = _row["observation_scopes"]
-                            try:
-                                _decoded = json.loads(_raw) if isinstance(_raw, str) else _raw
-                            except (json.JSONDecodeError, ValueError):
-                                continue
-                            if not isinstance(_decoded, list):
-                                continue  # a scalar mode: re-derived from the fresh tags
-                            _updated = _retagged_scopes(_decoded, _scope_rename)
-                            if _updated != _decoded:
-                                _key = json.dumps(_updated)
-                                _rescoped.setdefault(_key, []).append(_row["id"])
-                        for _updated_json, _ids in _rescoped.items():
-                            await conn.execute(
-                                f"UPDATE {fq_table('memory_units')} SET observation_scopes = $1, "
-                                f"updated_at = now() "
-                                f"WHERE document_id = $2 AND bank_id = $3 AND id = ANY($4::uuid[])",
-                                _updated_json,
-                                document_id,
-                                bank_id,
-                                _ids,
-                            )
                     # `tags` as well as `id`: the projection each unit must keep is read
                     # here, before the blanket write below overwrites it.
                     unit_rows = await conn.fetch(
-                        f"SELECT id, tags, fact_type FROM {fq_table('memory_units')} "
+                        f"SELECT id, tags, fact_type, observation_scopes FROM {fq_table('memory_units')} "
                         f"WHERE document_id = $1 AND bank_id = $2",
                         document_id,
                         bank_id,
                     )
+                    _by_scopes: dict[str, list] = {}
+                    for _row in unit_rows:
+                        _scopes = _renamed_scopes(_row["observation_scopes"], current_tags, retag)
+                        if _scopes != _normalize_scopes(_row["observation_scopes"]):
+                            _by_scopes.setdefault(json.dumps(_scopes), []).append(_row["id"])
+                    for _scopes_json, _ids in _by_scopes.items():
+                        await conn.execute(
+                            f"UPDATE {fq_table('memory_units')} SET observation_scopes = $1 "
+                            f"WHERE bank_id = $2 AND id = ANY($3::uuid[])",
+                            _scopes_json,
+                            bank_id,
+                            _ids,
+                        )
                     unit_ids = [str(row["id"]) for row in unit_rows if row["fact_type"] in ("experience", "world")]
 
                     await conn.execute(
