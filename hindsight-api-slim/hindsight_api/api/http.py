@@ -15,7 +15,7 @@ import re
 import time
 import traceback
 import uuid
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Sequence
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Annotated, Any, Literal, TypeVar
@@ -566,7 +566,8 @@ class RecallResult(BaseModel):
         description=(
             "Attachments this fact was drawn from, as recorded per fact at extraction time — the "
             "same edge the memory read endpoints return, not everything its chunk happened to "
-            "carry. A fact stated in prose reports none. Omitted when there are none."
+            "carry. A fact stated in prose reports none; an observation reports those of the facts "
+            "it was consolidated from. Omitted when there are none."
         ),
     )
 
@@ -998,6 +999,7 @@ async def _attach_to_memories(
     It is per fact, not per chunk: a chunk carrying a screenshot also carries the
     prose around it, and showing the screenshot against every fact from that one
     LLM call attributes the diagram to the paragraph that never mentioned it.
+    An observation shows the attachments of the facts it was consolidated from.
 
     One lookup for the whole page, not one per memory.
 
@@ -1008,6 +1010,7 @@ async def _attach_to_memories(
     back from a table the store never wrote.
     """
     unit_ids: list[str] = []
+    observation_ids: list[str] = []
     carried: dict[str, tuple[str | None, list[str]]] = {}
     for item in items:
         if not isinstance(item, dict):
@@ -1016,11 +1019,16 @@ async def _attach_to_memories(
         if not item.get("id"):
             continue
         unit_ids.append(item["id"])
+        # The list view names the type `fact_type`, the detail view `type`.
+        if (item.get("fact_type") or item.get("type")) == "observation":
+            observation_ids.append(str(item["id"]))
         if ids is not None:
             carried[str(item["id"])] = (item.get("document_id"), list(ids))
     if not unit_ids:
         return
-    by_unit = await memory_app.attachments_for_memories(bank_id, unit_ids, request_context, carried=carried)
+    by_unit = await memory_app.attachments_for_memories(
+        bank_id, unit_ids, request_context, carried=carried, observation_ids=observation_ids
+    )
     if not by_unit:
         return
     for item in items:
@@ -1032,11 +1040,11 @@ async def _attach_to_memories(
 async def _attach_to_recall_results(
     memory_app: "MemoryEngine",
     bank_id: str,
-    results: "list[RecallResult]",
+    results: "Sequence[RecallResult | ReflectFact]",
     request_context: RequestContext,
     carried: "dict[str, tuple[str | None, list[str]]] | None" = None,
 ) -> None:
-    """Add ``attachments`` to recall results — the same per-fact edge as :func:`_attach_to_memories`.
+    """Add ``attachments`` to recall results and reflect evidence — the per-fact edge of :func:`_attach_to_memories`.
 
     Recall already reports the chunk each fact came from, and a chunk lists every
     attachment its text references; that is strictly coarser. A chunk holding a
@@ -1055,7 +1063,13 @@ async def _attach_to_recall_results(
     unit_ids = [result.id for result in results if result.id]
     if not unit_ids:
         return
-    by_unit = await memory_app.attachments_for_memories(bank_id, unit_ids, request_context, carried=carried)
+    by_unit = await memory_app.attachments_for_memories(
+        bank_id,
+        unit_ids,
+        request_context,
+        carried=carried,
+        observation_ids=[result.id for result in results if result.id and result.type == "observation"],
+    )
     if not by_unit:
         return
     for result in results:
@@ -1652,6 +1666,18 @@ class ReflectFact(BaseModel):
     context: str | None = None
     occurred_start: str | None = None
     occurred_end: str | None = None
+    mentioned_at: str | None = None
+    document_id: str | None = None
+    chunk_id: str | None = None
+    tags: list[str] | None = None
+    metadata: dict[str, str] | None = None
+    attachments: list[ChunkAttachment] | None = Field(
+        default=None,
+        description=(
+            "Attachments this memory was drawn from — the same per-fact edge recall reports. "
+            "An observation reports those of the facts it was consolidated from. Omitted when there are none."
+        ),
+    )
 
 
 class ReflectDirective(BaseModel):
@@ -1800,6 +1826,64 @@ class BankProfileResponse(BaseModel):
     background: str | None = Field(default=None, description="Deprecated: use mission instead")
 
 
+class BankAliasEntry(BaseModel):
+    """One id a bank answers to."""
+
+    alias: str
+    primary: bool = Field(
+        default=False,
+        description=(
+            "Whether this alias is shown in place of the bank's own id. Display only — "
+            "the bank keeps its id, and everything that names a bank still uses it. At "
+            "most one alias per bank can be primary, and none has to be."
+        ),
+    )
+
+
+class BankAliasesResponse(BaseModel):
+    """Response model for a bank's aliases."""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "bank_id": "user123",
+                "aliases": [
+                    {"alias": "user-123", "primary": True},
+                    {"alias": "legacy-user123", "primary": False},
+                ],
+            }
+        }
+    )
+
+    bank_id: str = Field(description="The bank's own id, which an alias never replaces")
+    aliases: list[BankAliasEntry] = Field(
+        description="Extra ids that also reach this bank, the primary one first then oldest first"
+    )
+
+
+class SetBankAliasPrimaryRequest(BaseModel):
+    """Request model for showing (or no longer showing) an alias in place of the bank id."""
+
+    primary: bool = Field(description="True to present the bank under this alias; False to go back to its own id.")
+
+
+class CreateBankAliasRequest(BaseModel):
+    """Request model for adding an alias to a bank."""
+
+    model_config = ConfigDict(json_schema_extra={"example": {"alias": "user-123"}})
+
+    alias: str = Field(
+        description=(
+            "The extra bank id. Same rules as a bank id (non-empty, at most 192 bytes of UTF-8, no "
+            "control characters), and it must not already name a bank or another alias."
+        )
+    )
+    primary: bool = Field(
+        default=False,
+        description="Also show the bank under this alias, replacing whichever alias is shown today.",
+    )
+
+
 class UpdateDispositionRequest(BaseModel):
     """Request model for updating disposition traits."""
 
@@ -1882,6 +1966,22 @@ class BankListItem(BaseModel):
         description=(
             "When anything was last written to this bank: a document retained (including "
             "appends to an existing document) or a fact stored. Null if the bank is empty."
+        ),
+    )
+    display_alias: str | None = Field(
+        default=None,
+        description=(
+            "The alias this bank is presented under, when one was promoted. Display only: "
+            "`bank_id` remains the bank's identity everywhere else. Null when no alias is primary, "
+            "in which case show `bank_id`."
+        ),
+    )
+    matched_aliases: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Aliases of this bank that matched the search `q`. Empty when no search was "
+            "made, or when the bank matched on its own id or name — so a non-empty value "
+            "explains a result whose `bank_id` does not contain the search text."
         ),
     )
 
@@ -5302,7 +5402,38 @@ def _register_routes(app: FastAPI):
             else:
                 api_key = authorization.strip()
         extra_headers = collect_passthrough_headers(request.headers.raw, get_config().extension_passthrough_headers)
-        return RequestContext(api_key=api_key, extra_headers=extra_headers)
+        # One context per request, reused by every caller. The alias resolution on
+        # the route class builds one before FastAPI solves the endpoint's
+        # dependencies, and `authenticated_schema` is memoised on the object — so
+        # sharing it is what keeps a request to one tenant authentication.
+        cached = getattr(request.state, "hs_request_context", None)
+        if cached is not None:
+            return cached
+        context = RequestContext(api_key=api_key, extra_headers=extra_headers)
+        request.state.hs_request_context = context
+        return context
+
+    async def _resolve_bank_alias(request: Request, bank_id: str) -> str:
+        """Turn an aliased bank id from the path into the bank's canonical id.
+
+        Installed on ``app.state`` for the route class to call (see
+        :mod:`hindsight_api.api.unknown_params`), which is the one place every bank
+        endpoint passes through. It lives here, not there, because it needs this
+        app's engine and this request's tenant: aliases are per-schema, and the
+        schema comes from authenticating the caller.
+
+        Authentication is not extra work, only earlier work -- the endpoint's own
+        engine call authenticates too, and both reach the same cached contextvar.
+        """
+        # The engine authenticates the tenant and does the lookup: aliases are
+        # per-schema, and the schema comes from the caller's identity. This layer
+        # only supplies the request context, since API handlers do no data access.
+        return await app.state.memory.resolve_bank_alias(
+            bank_id,
+            request_context=get_request_context(request, request.headers.get("authorization")),
+        )
+
+    app.state.resolve_bank_alias = _resolve_bank_alias
 
     def admit_for(operation: PrecheckOperation):
         """Build a FastAPI dependency that holds an admission permit for the request.
@@ -6265,6 +6396,7 @@ def _register_routes(app: FastAPI):
                 memories = []
                 mental_models = []
                 directives = []
+                carried: dict[str, tuple[str | None, list[str]]] = {}
                 for fact_type, facts in core_result.based_on.items():
                     if fact_type == "directives":
                         # Directives are dicts with id, name, content (not MemoryFact objects)
@@ -6296,8 +6428,18 @@ def _register_routes(app: FastAPI):
                                     context=fact.context,
                                     occurred_start=fact.occurred_start,
                                     occurred_end=fact.occurred_end,
+                                    mentioned_at=fact.mentioned_at,
+                                    document_id=fact.document_id,
+                                    chunk_id=fact.chunk_id,
+                                    tags=fact.tags,
+                                    metadata=fact.metadata,
                                 )
                             )
+                            if fact.attachment_ids is not None:
+                                carried[fact.id] = (fact.document_id, fact.attachment_ids)
+                # The evidence is what a client shows beside the answer, so it gets the
+                # attachments recall would have shown for the same memories.
+                await _attach_to_recall_results(app.state.memory, bank_id, memories, request_context, carried=carried)
                 based_on_result = ReflectBasedOn(memories=memories, mental_models=mental_models, directives=directives)
 
             # Build trace (tool_calls + llm_calls + observations) if tool_calls is requested
@@ -7266,14 +7408,12 @@ def _register_routes(app: FastAPI):
             # parent_id is applied only when present in the body, so passing null
             # moves the node to the root (distinct from "not provided"), which is
             # what KEEP_PARENT stands in for. Page options live on the backing
-            # mental model and each applies only when supplied (so tags=[] clears,
-            # distinct from "not provided").
-            page_fields = {"source_query", "tags", "max_tokens", "trigger"} & body.model_fields_set
-            if body.name is None and "parent_id" not in body.model_fields_set and not page_fields:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Provide name, parent_id, source_query, tags, max_tokens, and/or trigger to update",
-                )
+            # mental model and take the opposite convention: null there means "not
+            # changing this", while an empty VALUE is a real change (tags=[] clears
+            # them). So a body that is null all the way down changes nothing at all,
+            # and the engine rejects it with a 400 before reading anything — a no-op
+            # authorizes no operation, and would otherwise hand the node's metadata
+            # to a caller the validator never got to judge.
             # One call, one transaction: a rename must not survive the move that
             # fails after it, which is what left clients retrying against a tree
             # they never asked for.
@@ -7282,9 +7422,11 @@ def _register_routes(app: FastAPI):
                 node_id=node_id,
                 name=body.name,
                 parent_id=body.parent_id if "parent_id" in body.model_fields_set else KEEP_PARENT,
-                source_query=body.source_query if "source_query" in page_fields else None,
-                tags=body.tags if "tags" in page_fields else None,
-                max_tokens=body.max_tokens if "max_tokens" in page_fields else None,
+                # Each page option defaults to None on the model, so an absent field
+                # and an explicit null are the same "not supplied" the engine expects.
+                source_query=body.source_query,
+                tags=body.tags,
+                max_tokens=body.max_tokens,
                 # Only the trigger fields the client stated: the engine patches them over
                 # the page's current trigger, and a full dump would carry this model's own
                 # defaults (mode="full", exclude_mental_models=False) into every update.
@@ -7296,7 +7438,7 @@ def _register_routes(app: FastAPI):
             # A new source query means the content is stale — rebuild it. Scheduled
             # only once the patch has committed, so a refresh is never queued for a
             # change that rolled back.
-            if "source_query" in page_fields and body.source_query is not None and updated.get("mental_model_id"):
+            if body.source_query is not None and updated.get("mental_model_id"):
                 await app.state.memory.submit_async_refresh_mental_model(
                     bank_id=bank_id,
                     mental_model_id=updated["mental_model_id"],
@@ -8189,6 +8331,132 @@ def _register_routes(app: FastAPI):
                 "GET /v1/default/banks/{bank_id}/config first if you relied on this endpoint's append behaviour."
             ),
         )
+
+    async def _alias_response(bank_id: str, request_context: RequestContext) -> BankAliasesResponse:
+        """The bank's aliases, shaped for the wire. Shared by all three alias routes,
+        which each answer with the whole list so a client never has to re-fetch."""
+        aliases = await app.state.memory.list_bank_aliases(bank_id, request_context=request_context)
+        return BankAliasesResponse(
+            bank_id=bank_id,
+            aliases=[BankAliasEntry(alias=a.alias, primary=a.primary) for a in aliases],
+        )
+
+    @app.get(
+        "/v1/default/banks/{bank_id}/aliases",
+        response_model=BankAliasesResponse,
+        summary="List the bank's aliases",
+        description=(
+            "Extra bank ids that reach this bank. Every endpoint accepts an alias wherever it "
+            "accepts a bank id, so callers can be moved onto a new id in phases while the old one "
+            "keeps working."
+        ),
+        operation_id="list_bank_aliases",
+        tags=["Banks"],
+    )
+    async def api_list_bank_aliases(bank_id: str, request_context: RequestContext = Depends(get_request_context)):
+        """List the extra ids this bank answers to."""
+        try:
+            return await _alias_response(bank_id, request_context)
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            raise _internal_error(e, f"/v1/default/banks/{bank_id}/aliases")
+
+    @app.post(
+        "/v1/default/banks/{bank_id}/aliases",
+        response_model=BankAliasesResponse,
+        status_code=201,
+        summary="Add an alias to the bank",
+        description=(
+            "Give the bank another id to answer to. Nothing is copied or moved: the bank keeps its "
+            "own id and all of its data, and the alias is only a second way to reach it — which is "
+            "what makes it a zero-downtime alternative to renaming.\n\n"
+            "Returns 409 if the name is already a bank or another alias."
+        ),
+        operation_id="create_bank_alias",
+        tags=["Banks"],
+    )
+    @audited("create_bank_alias")
+    async def api_create_bank_alias(
+        bank_id: str, request: CreateBankAliasRequest, request_context: RequestContext = Depends(get_request_context)
+    ):
+        """Add an extra id that reaches this bank."""
+        try:
+            await app.state.memory.create_bank_alias(
+                bank_id, request.alias, primary=request.primary, request_context=request_context
+            )
+            return await _alias_response(bank_id, request_context)
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            raise _internal_error(e, f"/v1/default/banks/{bank_id}/aliases")
+
+    @app.patch(
+        "/v1/default/banks/{bank_id}/aliases/{alias}",
+        response_model=BankAliasesResponse,
+        summary="Show this alias in place of the bank id",
+        description=(
+            "Present the bank under one of its aliases. Purely cosmetic: the bank keeps its own "
+            "`bank_id`, which every other part of the system — authorisation, metering, exports, "
+            "audit logs — continues to use.\n\n"
+            "Promoting an alias demotes whichever one was shown before, so a bank is presented "
+            "under at most one alias. Send `primary: false` to go back to showing its own id."
+        ),
+        operation_id="set_bank_alias_primary",
+        tags=["Banks"],
+    )
+    @audited("set_bank_alias_primary")
+    async def api_set_bank_alias_primary(
+        bank_id: str,
+        alias: str,
+        request: SetBankAliasPrimaryRequest,
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        """Choose which id this bank is displayed under."""
+        try:
+            if not await app.state.memory.set_bank_alias_primary(
+                bank_id, alias, request.primary, request_context=request_context
+            ):
+                raise HTTPException(status_code=404, detail=f"Bank '{bank_id}' has no alias '{alias}'")
+            return await _alias_response(bank_id, request_context)
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            raise _internal_error(e, f"/v1/default/banks/{bank_id}/aliases/{alias}")
+
+    @app.delete(
+        "/v1/default/banks/{bank_id}/aliases/{alias}",
+        response_model=BankAliasesResponse,
+        summary="Remove an alias from the bank",
+        description=(
+            "Stop an id reaching this bank. The bank and its memories are untouched; only the extra "
+            "name goes away, and callers still using it get the same 404 (or new empty bank) they "
+            "would have got before it existed."
+        ),
+        operation_id="delete_bank_alias",
+        tags=["Banks"],
+    )
+    @audited("delete_bank_alias")
+    async def api_delete_bank_alias(
+        bank_id: str, alias: str, request_context: RequestContext = Depends(get_request_context)
+    ):
+        """Detach one alias from this bank."""
+        try:
+            if not await app.state.memory.delete_bank_alias(bank_id, alias, request_context=request_context):
+                raise HTTPException(status_code=404, detail=f"Bank '{bank_id}' has no alias '{alias}'")
+            return await _alias_response(bank_id, request_context)
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            raise _internal_error(e, f"/v1/default/banks/{bank_id}/aliases/{alias}")
 
     @app.put(
         "/v1/default/banks/{bank_id}",

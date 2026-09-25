@@ -57,7 +57,8 @@
       "switchTitle": "切换记忆库",
       "returnTo": "返回 {bank}",
       "copyName": "复制名称",
-      "copied": "已复制到剪贴板"
+      "copied": "已复制到剪贴板",
+      "viaAlias": "通过 {aliases}"
     },
     "viewOnGitHub": "在 GitHub 查看"
   },
@@ -251,6 +252,24 @@
     "create": "创建",
     "save": "保存"
   },
+  "bankAliases": {
+    "title": "别名",
+    "description": "同样可以访问 <name>{bankId}</name> 的额外 ID，可让调用方在不停机的情况下迁移到新 ID。",
+    "placeholder": "新 ID",
+    "add": "添加",
+    "shownAsLabel": "显示为",
+    "shownAsDescription": "控制台为该记忆库显示的 ID。仅影响显示 —— 在其他所有地方 {bankId} 仍是它的标识。",
+    "primaryTitle": "显示在记忆库 ID 的位置",
+    "removeAria": "删除别名 {alias}",
+    "removeTitle": "要删除别名 {alias} 吗？",
+    "removeConfirm": "所有仍通过 {alias} 连接的应用会立即停止工作。消失的只是这个 ID —— {bankId} 及其记忆不受影响，之后也可以重新添加该别名。",
+    "remove": "删除别名",
+    "cancel": "取消",
+    "loadFailed": "加载别名失败",
+    "addFailed": "添加别名失败",
+    "primaryFailed": "更改显示的 ID 失败",
+    "removeFailed": "删除别名失败"
+  },
   "bankStats": {
     "memoryStore": "记忆存储",
     "memories": "记忆",
@@ -427,8 +446,8 @@
     "empathyDescription": "对情感背景的权重程度",
     "empathyLowLabel": "抽离",
     "empathyHighLabel": "共情",
-    "mcpToolsTitle": "MCP 工具",
-    "mcpToolsDescription": "限制此库向代理公开的 MCP 工具",
+    "clientsTitle": "客户端",
+    "clientsDescription": "应用和智能体在该记忆库上可以访问的内容。",
     "mcpFailedToSave": "无法保存 MCP 设置",
     "auditEnabledLabel": "启用审计日志",
     "auditEnabledDescription": "记录该记忆库的 retain、recall 和 reflect 操作。仅对该记忆库覆盖服务器默认值。",
@@ -578,7 +597,7 @@
     "memoryDefenseEnterpriseFeatureSizeAnomaly": "大小异常:拒绝可疑的过大负载",
     "memoryDefenseEnterpriseFeatureProtectedKeys": "受保护的标签命名空间:强制使用不可变的身份标签",
     "memoryDefenseEnterpriseCta": "申请演示",
-    "recallTitle": "召回流水线",
+    "recallTitle": "召回",
     "recallDescription": "该记忆库召回时执行的检索阶段",
     "recallServerDefault": "服务器默认值",
     "recallFailedToSave": "保存召回流水线设置失败",
@@ -1935,6 +1954,12 @@
         "fetch": "获取记忆库配置失败",
         "update": "更新记忆库配置失败",
         "reset": "重置记忆库配置失败"
+      },
+      "bankAliases": {
+        "list": "获取记忆库别名列表失败",
+        "create": "创建记忆库别名失败",
+        "delete": "删除记忆库别名失败",
+        "update": "更新记忆库别名失败"
       },
       "memories": {
         "list": "列出记忆单元失败",
