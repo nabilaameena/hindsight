@@ -284,6 +284,7 @@
     "temporal": "時間",
     "semantic": "語義",
     "entity": "實體",
+    "causal": "因果",
     "noLinksYet": "尚無連結",
     "consolidation": "整合",
     "testLlm": "測試 LLM 連線",

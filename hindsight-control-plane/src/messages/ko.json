@@ -284,6 +284,7 @@
     "temporal": "시간적",
     "semantic": "의미적",
     "entity": "엔티티",
+    "causal": "인과",
     "noLinksYet": "아직 링크 없음",
     "consolidation": "통합",
     "testLlm": "LLM 연결 테스트",

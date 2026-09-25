@@ -284,6 +284,7 @@
     "temporal": "Temporal",
     "semantic": "Semántico",
     "entity": "Entidad",
+    "causal": "Causal",
     "noLinksYet": "Aún no hay vínculos",
     "consolidation": "Consolidación",
     "testLlm": "Probar conexión del LLM",

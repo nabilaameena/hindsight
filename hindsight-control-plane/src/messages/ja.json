@@ -284,6 +284,7 @@
     "temporal": "時系列",
     "semantic": "セマンティック",
     "entity": "エンティティ",
+    "causal": "因果",
     "noLinksYet": "リンクがまだありません",
     "consolidation": "統合",
     "testLlm": "LLM接続をテスト",
