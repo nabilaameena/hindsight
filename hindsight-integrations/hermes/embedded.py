@@ -155,18 +155,38 @@ def _embed_scrubs_parent_env() -> bool:
         return False
 
 
+def _hermes_root() -> Path | None:
+    """The Hermes root that holds ``tools/`` — never a profile directory.
+
+    ``get_default_hermes_root`` resolves HERMES_HOME (``<root>/profiles/<name>`` maps back to
+    ``<root>``) and the platform default, which is ``%LOCALAPPDATA%\\hermes`` on Windows rather than
+    ``~/.hermes`` (#6524). ``hermes_constants`` is Hermes' stable public module (the plugin already
+    imports ``get_hermes_home`` from it); this one is read lazily, and a Hermes without it falls back
+    to the legacy candidates below instead of failing the daemon start."""
+    try:
+        from hermes_constants import get_default_hermes_root
+
+        return Path(get_default_hermes_root())
+    except Exception:
+        return None
+
+
 def _managed_uvx_dir(path: str) -> str | None:
     """Directory of the ``uvx`` Hermes installed for itself, when *path* has none.
 
     The daemon manager falls back to ``uvx hindsight-api`` when no server is installed, and a
-    package-manager Hermes keeps its uvx under ``~/.hermes/tools/uv-*/``, which is not always on
+    package-manager Hermes keeps its uvx under ``<hermes root>/tools/uv-*/``, which is not always on
     PATH (#5192). Only the helper's env gets it; the parent's PATH is left alone."""
     if shutil.which("uvx", path=path):
         return None
-    # The Docker image keeps its uv under the install root instead (/opt/hermes/tools, next to the
-    # /opt/hermes/.venv this interpreter runs from) while HOME is /opt/data (#5580). Hermes' own
-    # pm.install.uv_launcher would name it directly, but the plugin must not import pm.
-    for tools in (Path.home() / ".hermes" / "tools", Path(sys.prefix).parent / "tools"):
+    # The root comes from Hermes itself: it is %LOCALAPPDATA%\hermes on Windows and whatever
+    # HERMES_HOME names elsewhere, so a hardcoded ~/.hermes found nothing there (#6524). ~/.hermes
+    # stays as a fallback for a Hermes too old to answer. The Docker image keeps its uv under the
+    # install root instead (/opt/hermes/tools, next to the /opt/hermes/.venv this interpreter runs
+    # from) while HOME is /opt/data (#5580). Hermes' own pm.install.uv_launcher would name it
+    # directly, but the plugin must not import pm.
+    roots = (_hermes_root(), Path.home() / ".hermes", Path(sys.prefix).parent)
+    for tools in dict.fromkeys(root / "tools" for root in roots if root is not None):
         for candidate in sorted(tools.glob("uv-*"), reverse=True):
             if shutil.which("uvx", path=str(candidate)):
                 return str(candidate)
@@ -248,10 +268,19 @@ def _start_daemon(config: dict[str, str], profile: str) -> str:
     from hindsight_embed import get_embed_manager
 
     manager = get_embed_manager()
-    if _embed_scrubs_parent_env():
-        started = manager.ensure_running(config, profile)
-    else:
+    if not _embed_scrubs_parent_env():
         started = manager.is_running(profile) or _start_daemon_in_clean_child(config, profile)
+    elif _managed_uvx_dir(os.environ.get("PATH", "")) and not manager.is_running(profile):
+        # A new embed scrubs our interpreter env itself, but the daemon child still inherits this
+        # process's PATH, and config can only carry HINDSIGHT_* keys. So when uvx is reachable only
+        # through Hermes' managed copy, the start goes through the helper anyway: it is the one place
+        # PATH is extended without touching our own os.environ. Taking the direct branch here left the
+        # #5192 fallback unreachable on every embed >= 0.10.3 (#6451). The filesystem probe runs first
+        # so the common case (uvx on PATH) still costs a single ensure_running, and a live daemon needs
+        # no uvx, so it is reused in-process below.
+        started = _start_daemon_in_clean_child(config, profile)
+    else:
+        started = manager.ensure_running(config, profile)
     if not started:
         raise RuntimeError(f"Failed to start the Hindsight daemon for profile {profile!r}")
     return manager.get_url(profile)

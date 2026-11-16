@@ -51,10 +51,15 @@ def test_an_unrelated_import_failure_gets_no_install_hint(monkeypatch):
     assert embedded._local_runtime_hint(status.reason) == ""
 
 
-def _fake_embed_module(monkeypatch, *, running=True, url="http://127.0.0.1:54321", scrubs=True):
+def _fake_embed_module(
+    monkeypatch, *, running=True, url="http://127.0.0.1:54321", scrubs=True, managed_uvx: str | None = None
+):
     """Stand in for hindsight_embed. *scrubs* says whether the installed release drops our
-    PYTHONPATH from the daemon child itself (the release after 0.10.2 does)."""
+    PYTHONPATH from the daemon child itself (the release after 0.10.2 does). *managed_uvx* is what
+    the Hermes-managed uvx probe answers, pinned so the branch taken never depends on this machine's
+    PATH or ~/.hermes/tools."""
     calls = {}
+    monkeypatch.setattr(embedded, "_managed_uvx_dir", lambda path: managed_uvx)
 
     class _Manager:
         def ensure_running(self, config, profile):
@@ -214,13 +219,29 @@ def test_the_helper_imports_embed_through_pythonpath_and_hides_it_from_the_daemo
     assert json.loads(seen.read_text()) == ["hermes", {"HINDSIGHT_API_LLM_MODEL": "m"}, False]
 
 
+def _fake_uvx(directory: Path) -> Path:
+    """An executable ``uvx`` in *directory*. Windows resolves commands through PATHEXT, so there the
+    launcher is ``uvx.exe``, the name Hermes' managed uv ships with."""
+    directory.mkdir(parents=True)
+    launcher = directory / ("uvx.exe" if sys.platform == "win32" else "uvx")
+    launcher.write_text("#!/bin/sh\n")
+    launcher.chmod(0o755)
+    return directory
+
+
+def _hermes_root_is(monkeypatch, root):
+    """What Hermes' get_default_hermes_root answers; None models a Hermes too old to have it."""
+    if root is None:
+        monkeypatch.delattr(sys.modules["hermes_constants"], "get_default_hermes_root", raising=False)
+    else:
+        monkeypatch.setattr(sys.modules["hermes_constants"], "get_default_hermes_root", lambda: root, raising=False)
+
+
 def test_the_helper_finds_the_uvx_hermes_installed_when_path_has_none(tmp_path, monkeypatch):
     """#5192: a package-manager Hermes keeps uvx under ~/.hermes/tools/uv-*/, off PATH."""
-    uv_dir = tmp_path / ".hermes" / "tools" / "uv-0.12.3-darwin-arm64"
-    uv_dir.mkdir(parents=True)
-    (uv_dir / "uvx").write_text("#!/bin/sh\n")
-    (uv_dir / "uvx").chmod(0o755)
+    uv_dir = _fake_uvx(tmp_path / ".hermes" / "tools" / "uv-0.12.3-darwin-arm64")
     monkeypatch.setattr(embedded.Path, "home", lambda: tmp_path)
+    _hermes_root_is(monkeypatch, None)
 
     assert embedded._managed_uvx_dir(str(tmp_path / "empty")) == str(uv_dir)
     assert embedded._managed_uvx_dir(str(uv_dir)) is None  # already on PATH: leave it
@@ -228,14 +249,57 @@ def test_the_helper_finds_the_uvx_hermes_installed_when_path_has_none(tmp_path, 
 
 def test_the_helper_finds_the_uvx_under_the_hermes_install_root(tmp_path, monkeypatch):
     """#5580: in the Docker image uv lives under /opt/hermes/tools, beside /opt/hermes/.venv."""
-    uv_dir = tmp_path / "opt" / "hermes" / "tools" / "uv-0.12.3-linux-x64"
-    uv_dir.mkdir(parents=True)
-    (uv_dir / "uvx").write_text("#!/bin/sh\n")
-    (uv_dir / "uvx").chmod(0o755)
+    uv_dir = _fake_uvx(tmp_path / "opt" / "hermes" / "tools" / "uv-0.12.3-linux-x64")
     monkeypatch.setattr(embedded.Path, "home", lambda: tmp_path / "data")
     monkeypatch.setattr(sys, "prefix", str(tmp_path / "opt" / "hermes" / ".venv"))
+    _hermes_root_is(monkeypatch, None)
 
     assert embedded._managed_uvx_dir(str(tmp_path / "empty")) == str(uv_dir)
+
+
+def test_the_helper_finds_the_uvx_under_the_root_hermes_resolves(tmp_path, monkeypatch):
+    """#6524: on Windows the Hermes root is %LOCALAPPDATA%\\hermes, not ~/.hermes, and the plugin runs
+    from a venv under installs/<hash>/environments/<hash>/ whose parent has no tools/ either. The
+    root Hermes itself resolves (HERMES_HOME, or the platform default) is where the uv lives."""
+    root = tmp_path / "AppData" / "Local" / "hermes"
+    _fake_uvx(root / "tools" / "uv-0.12.3-win32-x64")
+    newest = _fake_uvx(root / "tools" / "uv-0.13.5-win32-x64")
+    monkeypatch.setattr(embedded.Path, "home", lambda: tmp_path)  # no ~/.hermes here
+    monkeypatch.setattr(sys, "prefix", str(root / "installs" / "a1" / "environments" / "b2" / "venv"))
+    _hermes_root_is(monkeypatch, root)
+
+    assert embedded._managed_uvx_dir(str(tmp_path / "empty")) == str(newest)
+
+
+def test_a_new_embed_starts_through_the_helper_when_only_the_managed_uvx_exists(monkeypatch):
+    """#6451: embed >= 0.10.3 scrubs PYTHONPATH itself, but its daemon child inherits our PATH, so a
+    managed uvx missing from PATH used to fail with 'Command not found: uvx'. Hand the start to the
+    helper, whose env gets the managed uvx, and leave this process's PATH alone."""
+    calls = _fake_embed_module(monkeypatch, running=False, scrubs=True, managed_uvx="/hermes/tools/uv-0.13.5")
+    monkeypatch.setenv("PATH", "/usr/bin")
+    recorded = {}
+
+    def _run(cmd, **kwargs):
+        recorded.update(kwargs)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(embedded.subprocess, "run", _run)
+
+    assert embedded._start_daemon({}, "hermes") == "http://127.0.0.1:54321"
+    assert "ensure_running" not in calls  # started by the helper, not in this process
+    assert recorded["env"]["PATH"].split(embedded.os.pathsep) == ["/hermes/tools/uv-0.13.5", "/usr/bin"]
+    assert embedded.os.environ["PATH"] == "/usr/bin"
+
+
+def test_a_new_embed_reuses_a_live_daemon_in_process_even_with_only_the_managed_uvx(monkeypatch):
+    """A running daemon needs no uvx: re-register it in-process instead of spawning a helper."""
+    calls = _fake_embed_module(monkeypatch, running=True, scrubs=True, managed_uvx="/hermes/tools/uv-0.13.5")
+    monkeypatch.setattr(
+        embedded.subprocess, "run", lambda *a, **k: pytest.fail("must not spawn a helper for a live daemon")
+    )
+
+    assert embedded._start_daemon({}, "hermes") == "http://127.0.0.1:54321"
+    assert calls["ensure_running"] == ({}, "hermes")
 
 
 def test_a_keyless_openai_compatible_server_gets_a_placeholder_key():
